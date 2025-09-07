@@ -168,18 +168,27 @@ def compute_coherence(embedder, cross_encoder, question: str, answer: str) -> Tu
 
 def compute_clarity(answer: str, lt_tool) -> Tuple[float, Dict[str, float]]:
     """Combine readability and grammar into a clarity score in [0,1]."""
-    import textstat
+    # textstat might be missing in some environments (e.g., slim deployments)
+    try:
+        import textstat  # type: ignore
+        _has_textstat = True
+    except Exception:
+        textstat = None  # type: ignore
+        _has_textstat = False
 
     a = answer.strip()
     if not a:
         return 0.0, {"readability": 0.0, "grammar": 0.0}
 
     # Flesch Reading Ease: roughly [0,100+]; map to [0,1]
-    try:
-        fre = textstat.flesch_reading_ease(a)
-        fre = max(0.0, min(100.0, float(fre)))
-        readability = fre / 100.0
-    except Exception:
+    if _has_textstat:
+        try:
+            fre = textstat.flesch_reading_ease(a)  # type: ignore
+            fre = max(0.0, min(100.0, float(fre)))
+            readability = fre / 100.0
+        except Exception:
+            readability = 0.5
+    else:
         readability = 0.5
 
     # Grammar: normalize issue count by length (simple heuristic)
@@ -386,17 +395,61 @@ DEFAULT_TEXT = (
     "A: It might be Jupiter, probably.\n"
 )
 
+# --- Input area: paste or upload ---
+st.subheader("Input")
 input_text = st.text_area(
     "Paste Q/A pairs (use 'Q:' and 'A:' markers; multi-line supported)",
     value=DEFAULT_TEXT,
     height=220,
 )
 
+uploaded = st.file_uploader("Or upload a .txt or .csv file", type=["txt", "csv"], accept_multiple_files=False)
+
+uploaded_pairs: List[Tuple[str, str]] = []
+uploaded_ready = False
+if uploaded is not None:
+    try:
+        if uploaded.type == "text/plain" or uploaded.name.lower().endswith(".txt"):
+            content = uploaded.read().decode("utf-8", errors="ignore")
+            uploaded_pairs = parse_qa_blocks(content)
+            uploaded_ready = True if uploaded_pairs else False
+            if not uploaded_ready:
+                st.warning("No Q/A pairs detected in uploaded .txt. Ensure 'Q:' and 'A:' markers are used.")
+        else:
+            # CSV path: expect columns question,answer (case-insensitive). If 2 cols, use first two.
+            df_up = pd.read_csv(uploaded)
+            cols_lower = [c.lower() for c in df_up.columns]
+            q_col = None
+            a_col = None
+            if "question" in cols_lower and "answer" in cols_lower:
+                q_col = df_up.columns[cols_lower.index("question")]
+                a_col = df_up.columns[cols_lower.index("answer")]
+            elif len(df_up.columns) >= 2:
+                q_col, a_col = df_up.columns[0], df_up.columns[1]
+            if q_col is None or a_col is None:
+                st.error("CSV must have 'question' and 'answer' columns or at least two columns.")
+            else:
+                uploaded_pairs = [
+                    (str(q) if not pd.isna(q) else "", str(a) if not pd.isna(a) else "")
+                    for q, a in zip(df_up[q_col].tolist(), df_up[a_col].tolist())
+                ]
+                # filter empty pairs
+                uploaded_pairs = [(q, a) for q, a in uploaded_pairs if q.strip() and a.strip()]
+                uploaded_ready = True if uploaded_pairs else False
+                if not uploaded_ready:
+                    st.warning("No valid Q/A rows found in CSV.")
+    except Exception as exc:
+        st.error(f"Failed to read uploaded file: {exc}")
+
 col_btn1, col_btn2 = st.columns([1, 1])
 with col_btn1:
     run_btn = st.button("Evaluate", use_container_width=True)
 with col_btn2:
     clear_btn = st.button("Clear History", use_container_width=True)
+
+run_uploaded_btn = None
+if uploaded is not None:
+    run_uploaded_btn = st.button("Evaluate Uploaded File", use_container_width=True)
 
 
 if "history" not in st.session_state:
@@ -448,6 +501,9 @@ if run_btn:
     else:
         evaluate_pairs(pairs)
 
+if run_uploaded_btn and uploaded_ready:
+    evaluate_pairs(uploaded_pairs)
+
 
 # Convert history to DataFrame
 if st.session_state.history:
@@ -476,6 +532,16 @@ if st.session_state.history:
         "fact_rationale", "coh_rationale",
     ]
     st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+
+    # Download results
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download results as CSV",
+        data=csv_bytes,
+        file_name="ai_trust_meter_results.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 else:
     st.info("Enter Q/A pairs and click Evaluate to see results.")
 
